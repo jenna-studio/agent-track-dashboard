@@ -19,6 +19,9 @@ export interface KanbanBoardProps {
   className?: string;
 }
 
+/** Max number of completed tasks to render in the Done column */
+const DONE_COLUMN_DISPLAY_LIMIT = 50;
+
 /**
  * KanbanBoard is the main container for the kanban view
  * Features:
@@ -135,13 +138,16 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                 (task) => task.status === statusKey
               );
 
-              // Sort Done column by newest first (most recent updatedAt)
+              // Sort Done column by newest first (most recent updatedAt),
+              // and cap the display at the 50 most-recent to avoid flooding
               const sortedTasks = statusKey === 'done'
-                ? [...columnTasks].sort((a, b) => {
-                    const dateA = new Date(a.completedAt || a.updatedAt).getTime();
-                    const dateB = new Date(b.completedAt || b.updatedAt).getTime();
-                    return dateB - dateA; // Descending order (newest first)
-                  })
+                ? [...columnTasks]
+                    .sort((a, b) => {
+                      const dateA = new Date(a.completedAt || a.updatedAt).getTime();
+                      const dateB = new Date(b.completedAt || b.updatedAt).getTime();
+                      return dateB - dateA; // Descending order (newest first)
+                    })
+                    .slice(0, DONE_COLUMN_DISPLAY_LIMIT)
                 : columnTasks;
 
               return (
