@@ -143,7 +143,7 @@ function installHook(projectPath: string): void {
     const hooks = (settings.hooks as Record<string, unknown[]> | undefined) ?? {};
     let changed = false;
 
-    for (const [event] of [['SessionStart'], ['PostToolUse'], ['Stop']] as const) {
+    for (const [event] of [['SessionStart'], ['PostToolUse'], ['Stop'], ['SessionEnd']] as const) {
       const existing = (hooks[event] as Array<{ hooks: Array<{ command: string }> }> | undefined) ?? [];
       const alreadyRegistered = existing.some((h) =>
         h.hooks?.some((c) => c.command?.includes('track-activity.sh')),
@@ -169,7 +169,7 @@ function installHook(projectPath: string): void {
  * The keeper keeps agent heartbeats alive and auto-syncs git changes to the
  * dashboard — it runs for the lifetime of the coding session.
  */
-function launchKeeper(projectPath: string): void {
+function launchKeeper(projectPath: string, boardId?: string): void {
   const keeperScript = resolve(PROJECT_ROOT, 'scripts/agent-keeper.py');
   // Try python3 first, fall back to python
   const python = process.platform === 'win32' ? 'python' : 'python3';
@@ -179,6 +179,10 @@ function launchKeeper(projectPath: string): void {
       cwd: PROJECT_ROOT,
       detached: true,
       stdio: 'ignore',
+      // Pin the keeper to the same board this MCP server is using, so the
+      // keeper, the activity hook and the MCP tools don't each pick their own.
+      // The keeper also holds a per-project lock, so a second one exits at once.
+      env: { ...process.env, ...(boardId ? { AGENT_TRACK_BOARD_ID: boardId } : {}) },
     });
     child.unref();
     console.error(`[Launcher] Keeper started (PID ${child.pid}) watching ${projectPath}`);
@@ -247,7 +251,7 @@ export async function launchDashboard(boardId?: string): Promise<void> {
     installHook(process.cwd());
 
     // Start the keeper to maintain heartbeats and auto-sync git changes
-    launchKeeper(process.cwd());
+    launchKeeper(process.cwd(), boardId);
 
     // Always open browser on MCP startup.
     const url = boardId ? `${DASHBOARD_URL}/board/${boardId}` : DASHBOARD_URL;

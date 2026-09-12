@@ -23,19 +23,35 @@ const dbPath = process.env.DATABASE_PATH || defaultDbPath;
 const transportMode = (process.env.MCP_TRANSPORT || 'stdio').toLowerCase();
 
 function ensureProjectBoard(server: AgentKanbanMCPServer): string {
-  // Always create a fresh board for the current working directory so
-  // every coding session starts from a clean dashboard state.
+  // Reuse the board already bound to this working directory so the MCP server,
+  // the activity hook and the keeper all write to the SAME board. Creating a
+  // new board per launch used to split writes across boards, which is why the
+  // dashboard looked empty while work was happening.
   const cwd = process.cwd();
+  const existing = server.findBoardByProjectPath(cwd);
+  if (existing) {
+    console.error(`[MCP] Using existing board ${existing} for project ${cwd}`);
+    return existing;
+  }
+
   const boardId = server.createBoardForProject(cwd);
-  console.error(`[MCP] Created fresh board ${boardId} for project ${cwd}`);
+  console.error(`[MCP] Created board ${boardId} for project ${cwd}`);
 
   return boardId;
 }
 
-function shouldAutoLaunchDashboard(): boolean {
-  // Default is true so MCP startup automatically opens dashboard.
-  // Set AUTO_LAUNCH_DASHBOARD=false to disable.
-  return process.env.AUTO_LAUNCH_DASHBOARD !== 'false';
+/**
+ * Everything that reaches outside this process — spawning the API server and
+ * dashboard, opening a browser, installing hooks, starting the keeper — is
+ * OFF by default. Opening a project in an editor starts the MCP server, and
+ * that must not drag a whole toolchain up with it. Tracking begins only when
+ * the `start_tracking` tool is called, or when autostart is opted into.
+ */
+function isAutostartEnabled(): boolean {
+  // Back-compat: honour the old per-feature switches when explicitly set.
+  if (process.env.AUTO_LAUNCH_DASHBOARD === 'true') return true;
+  if (process.env.AUTO_LAUNCH_DASHBOARD === 'false') return false;
+  return process.env.AGENT_TRACK_AUTOSTART === 'true';
 }
 
 async function bootstrapProjectBoard(dbPathValue: string): Promise<string> {
@@ -54,20 +70,15 @@ async function runStdioMode() {
   const server = new AgentKanbanMCPServer(dbPath);
   await server.run();
 
-  const shouldBootstrapProjectBoard = process.env.MCP_BOOTSTRAP_PROJECT_BOARD !== 'false';
-  if (!shouldBootstrapProjectBoard) {
+  if (!isAutostartEnabled()) {
+    console.error('[MCP] Idle — call the start_tracking tool to open the dashboard.');
     return;
   }
 
+  // Opt-in path: behave like the old always-on startup.
   const boardId = ensureProjectBoard(server);
-
-  if (shouldAutoLaunchDashboard()) {
-    console.error('[MCP] Auto-launching dashboard...');
-    launchDashboard(boardId);
-  } else {
-    console.error('[MCP] Dashboard auto-launch disabled (AUTO_LAUNCH_DASHBOARD=false).');
-    console.error(`[MCP] View dashboard manually at: http://localhost:5173/board/${boardId}`);
-  }
+  console.error('[MCP] AGENT_TRACK_AUTOSTART=true — launching dashboard...');
+  launchDashboard(boardId);
 }
 
 function readHttpPort(): number {
@@ -82,12 +93,12 @@ function readHttpPort(): number {
 }
 
 async function runHttpMode() {
-  if (shouldAutoLaunchDashboard()) {
+  if (isAutostartEnabled()) {
     const boardId = await bootstrapProjectBoard(dbPath);
-    console.error('[MCP] Auto-launching dashboard...');
+    console.error('[MCP] AGENT_TRACK_AUTOSTART=true — launching dashboard...');
     void launchDashboard(boardId);
   } else {
-    console.error('[MCP] Dashboard auto-launch disabled (AUTO_LAUNCH_DASHBOARD=false).');
+    console.error('[MCP] Idle — call the start_tracking tool to open the dashboard.');
   }
 
   await startStreamableHttpServer({

@@ -36,6 +36,10 @@ import signal
 import uuid
 import json
 import argparse
+import os
+import fcntl
+import hashlib
+import tempfile
 from pathlib import Path
 from datetime import datetime
 import urllib.request
@@ -52,6 +56,69 @@ API_URL        = "http://localhost:3000"
 POLL_SEC       = 8    # how often to check for git changes
 HEARTBEAT_SEC  = 15   # how often to send heartbeats (must be < 5 min to stay "active")
 IDLE_CLOSE_SEC = 180  # close task after this many seconds of no changes
+
+LOCK_DIR = Path(tempfile.gettempdir()) / "agent-track-keeper"
+
+# Held for the lifetime of the process; flock is released automatically on exit.
+_LOCK_FH = None
+
+
+def acquire_singleton_lock(project: Path) -> bool:
+    """
+    Allow only one keeper per project.
+
+    Every MCP server startup used to spawn another keeper, and they never
+    exited — a dozen of them would race to create a card for the same file,
+    which is where the duplicate task cards came from.
+    """
+    global _LOCK_FH
+    try:
+        LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha1(str(project).encode()).hexdigest()[:16]
+        fh = open(LOCK_DIR / f"{key}.lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    except Exception:
+        # Never let locking problems stop tracking entirely.
+        return True
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _LOCK_FH = fh
+    return True
+
+
+# ── agent identity ────────────────────────────────────────────────────────────
+# (name, type, identifying env vars, AI_AGENT aliases) — most specific first.
+_AGENT_RULES = [
+    ("Claude Code",    "claude-code", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"], ["claude"]),
+    ("Codex",          "codex",       ["CODEX_SANDBOX", "CODEX_HOME", "CODEX_THREAD_ID"],                 ["codex"]),
+    ("Gemini CLI",     "gemini",      ["GEMINI_CLI", "GEMINI_SANDBOX", "GEMINI_SESSION_ID"],              ["gemini"]),
+    ("Cursor",         "cursor",      ["CURSOR_AGENT", "CURSOR_TRACE_ID"],                                ["cursor"]),
+    ("GitHub Copilot", "copilot",     ["COPILOT_AGENT_ID", "GITHUB_COPILOT_AGENT"],                       ["copilot"]),
+    ("Windsurf",       "windsurf",    ["WINDSURF_SESSION_ID", "WINDSURF_AGENT"],                          ["windsurf", "codeium"]),
+    ("Aider",          "aider",       ["AIDER_MODEL", "AIDER_SESSION"],                                   ["aider"]),
+]
+
+
+def detect_agent_identity():
+    """Work out which AI tool we are tracking. Never assume Claude."""
+    name = os.environ.get("AGENT_TRACK_AGENT_NAME")
+    typ = os.environ.get("AGENT_TRACK_AGENT_TYPE")
+    if name or typ:
+        slug = typ or name.lower().replace(" ", "-")
+        return {"name": name or slug.replace("-", " ").title(), "type": slug}
+
+    generic = (os.environ.get("AI_AGENT") or "").strip()
+    slug = generic.split("_")[0].lower() if generic else ""
+
+    for disp, kind, envs, aliases in _AGENT_RULES:
+        if any(os.environ.get(e) for e in envs) or any(a in slug for a in aliases):
+            return {"name": disp, "type": kind}
+
+    if slug:
+        return {"name": slug.replace("-", " ").title(), "type": slug}
+    return {"name": "Unknown Agent", "type": "unknown"}
 
 
 # ── stdlib HTTP helpers ────────────────────────────────────────────────────────
@@ -201,9 +268,16 @@ class AgentKeeper:
         self.mcp_agent_id   = None  # set once we find it
         self.mcp_agent_name = None
 
+        self.identity         = detect_agent_identity()
+
         self.board_id         = None
-        self.file_tasks       = {}   # file_path -> {"id": ..., "title": ...}
-        self.submitted_diffs  = {}   # file_path -> last diff hash submitted
+        # file_path -> {"id", "title", "sig", "last_change"}
+        self.file_tasks       = {}
+        self.submitted_diffs  = {}   # file_path -> last diff signature submitted
+        # file_path -> signature we last CLOSED a card on. A dirty file stays
+        # dirty until it is committed, so without this a closed card would be
+        # recreated on the very next poll, forever.
+        self.closed_sigs      = {}
         self.last_hash        = None
         self.last_change_ts   = 0.0
 
@@ -262,12 +336,26 @@ class AgentKeeper:
 
     def _setup_board(self):
         project_str = str(self.project)
+
+        # An explicit board wins: the MCP server passes this so the keeper, the
+        # hook and the MCP tools all write to one board instead of three.
+        pinned = os.environ.get("AGENT_TRACK_BOARD_ID")
+        if pinned:
+            self.board_id = pinned
+            print(f"[keeper] Board pinned : {self.board_id}")
+            return
+
         resp = GET("/api/boards")
-        for board in (resp.get("data") or []):
-            if board.get("projectPath") == project_str:
-                self.board_id = board["id"]
-                print(f"[keeper] Board found  : {board.get('name')} ({self.board_id})")
-                return
+        matching = [b for b in (resp.get("data") or [])
+                    if b.get("projectPath") == project_str]
+        if matching:
+            # Newest first — the API orders by updated_at, but be explicit
+            # rather than depending on it.
+            matching.sort(key=lambda b: str(b.get("createdAt") or ""), reverse=True)
+            board = matching[0]
+            self.board_id = board["id"]
+            print(f"[keeper] Board found  : {board.get('name')} ({self.board_id})")
+            return
 
         log  = git_log_oneline(self.project, 3)
         resp = POST("/api/boards", {
@@ -360,7 +448,12 @@ class AgentKeeper:
         return self.mcp_agent_id or self.monitor_id
 
     def _agent_name_for_task(self):
-        return self.mcp_agent_name or "Agent Keeper"
+        # Prefer the agent the MCP server registered (it knows exactly which
+        # tool it serves); otherwise fall back to environment detection.
+        return self.mcp_agent_name or self.identity["name"]
+
+    def _agent_type_for_task(self):
+        return self.identity["type"]
 
     def _create_task(self, title, description="", status="in_progress"):
         if not self.board_id:
@@ -371,7 +464,7 @@ class AgentKeeper:
             "description": description,
             "agentId":     self._agent_id_for_task(),
             "agentName":   self._agent_name_for_task(),
-            "agentType":   "claude",
+            "agentType":   self._agent_type_for_task(),
             "status":      status,
             "importance":  "high",
             "progress":    0,
@@ -382,44 +475,86 @@ class AgentKeeper:
             print(f"[keeper] Task created : {task['id']} — {title}")
         return task
 
+    def _complete_file_task(self, file_path, reason):
+        """Move a single file's card to Done and remember what we closed on."""
+        task = self.file_tasks.pop(file_path, None)
+        if not task:
+            return
+        PATCH(f"/api/tasks/{task['id']}", {
+            "status":        "done",
+            "progress":      100,
+            "currentAction": reason,
+        })
+        self._notify("task_updated", {"taskId": task["id"]})
+        if task.get("sig"):
+            self.closed_sigs[file_path] = task["sig"]
+        self.submitted_diffs.pop(file_path, None)
+        print(f"[keeper] Task done    : {task['id']}  ({Path(file_path).name}) — {reason}")
+
     def _complete_all_tasks(self, summary=""):
-        for file_path, task in list(self.file_tasks.items()):
-            tid = task["id"]
-            PATCH(f"/api/tasks/{tid}", {
-                "status":        "done",
-                "progress":      100,
-                "currentAction": summary or "Completed",
-            })
-            self._notify("task_updated", {"taskId": tid})
-            print(f"[keeper] Task done    : {tid}  ({Path(file_path).name})")
-        self.file_tasks = {}
-        self.submitted_diffs = {}
+        for file_path in list(self.file_tasks):
+            self._complete_file_task(file_path, summary or "Completed")
+
+    def _find_existing_open_task(self, file_path, title):
+        """
+        Reuse a card another writer already opened for this file — the activity
+        hook, or a keeper from a previous run. Without this every writer opens
+        its own card for the same file.
+        """
+        for status in ("in_progress", "claimed", "todo"):
+            resp = GET("/api/tasks", {"boardId": self.board_id, "status": status})
+            for t in (resp.get("data") or []):
+                files = t.get("files") or []
+                if t.get("title") == title or file_path in files:
+                    return {"id": t["id"], "title": t.get("title") or title}
+        return None
 
     def _ensure_file_task(self, file_path, change_type, branch):
-        """Get or create a dedicated task for a single file."""
+        """Get or create the single dedicated task for one file."""
         if file_path in self.file_tasks:
             return self.file_tasks[file_path]
+
         basename = Path(file_path).name
         title = f"Edit {basename}"
-        desc  = f"Branch: `{branch}`\nFile: `{file_path}` ({change_type})"
-        task  = self._create_task(title, desc)
+
+        existing = self._find_existing_open_task(file_path, title)
+        if existing:
+            self.file_tasks[file_path] = {
+                "id": existing["id"], "title": existing["title"],
+                "sig": None, "last_change": time.time(),
+            }
+            return self.file_tasks[file_path]
+
+        desc = f"Branch: `{branch}`\nFile: `{file_path}` ({change_type})"
+        task = self._create_task(title, desc)
         if task and task.get("id"):
-            self.file_tasks[file_path] = {"id": task["id"], "title": title}
+            self.file_tasks[file_path] = {
+                "id": task["id"], "title": title,
+                "sig": None, "last_change": time.time(),
+            }
             return self.file_tasks[file_path]
         return None
+
+    def _file_signature(self, file_path):
+        """Fingerprint of a file's current uncommitted content."""
+        diff = git_file_diff(file_path, self.project)
+        return hashlib.sha1((diff or "").encode("utf-8", "replace")).hexdigest(), diff
 
     # ── git sync ──────────────────────────────────────────────────────────────
 
     def _sync_changes(self):
         changed  = git_changed_files(self.project)
-        cur_hash = git_head(self.project)
+        self.last_hash = git_head(self.project)
 
-        self.last_hash = cur_hash
+        now = time.time()
+        changed_paths = {fi["filePath"] for fi in changed}
 
-        if not changed:
-            return
-
-        self.last_change_ts = time.time()
+        # A tracked file that is no longer dirty was committed or reverted.
+        # That is the clearest "this piece of work is finished" signal we get.
+        for file_path in list(self.file_tasks):
+            if file_path not in changed_paths:
+                self._complete_file_task(file_path, "Committed")
+                self.closed_sigs.pop(file_path, None)
 
         # Cap to 5 files per cycle to avoid task explosion
         MAX_FILES = 5
@@ -430,41 +565,60 @@ class AgentKeeper:
         branch = git_branch(self.project)
         lines  = git_numstat(self.project)
 
-        # One task per changed file
         for fi in changed:
             file_path   = fi["filePath"]
             change_type = fi["changeType"]
+
+            sig, diff = self._file_signature(file_path)
+
+            # We already closed a card on exactly this content. Only a real new
+            # edit should reopen work for this file.
+            if self.closed_sigs.get(file_path) == sig:
+                continue
 
             task = self._ensure_file_task(file_path, change_type, branch)
             if not task:
                 continue
 
+            # Nothing actually changed since the last poll — leave the card
+            # alone so its idle timer can run down and close it.
+            if task.get("sig") == sig:
+                continue
+
+            task["sig"] = sig
+            task["last_change"] = now
+            self.last_change_ts = now
+
             tid  = task["id"]
             prog = min(10 + (lines["added"] + lines["removed"]) // 4, 85)
 
             PATCH(f"/api/tasks/{tid}", {
+                "status":        "in_progress",
                 "files":         [file_path],
                 "currentAction": f"Modifying {Path(file_path).name}",
                 "progress":      prog,
             })
 
-            # Only submit diff if it has changed since last submission
-            diff = git_file_diff(file_path, self.project)
-            if diff:
-                diff_hash = hash(diff)
-                if self.submitted_diffs.get(file_path) != diff_hash:
-                    POST(f"/api/tasks/{tid}/code-changes", {
-                        "filePath":     file_path,
-                        "changeType":   change_type,
-                        "diff":         diff,
-                        "linesAdded":   lines["added"],
-                        "linesRemoved": lines["removed"],
-                    })
-                    self.submitted_diffs[file_path] = diff_hash
+            if diff and self.submitted_diffs.get(file_path) != sig:
+                POST(f"/api/tasks/{tid}/code-changes", {
+                    "filePath":     file_path,
+                    "changeType":   change_type,
+                    "diff":         diff,
+                    "linesAdded":   lines["added"],
+                    "linesRemoved": lines["removed"],
+                })
+                self.submitted_diffs[file_path] = sig
 
             self._notify("task_updated", {"taskId": tid})
 
-        print(f"[keeper] Synced {len(changed):2d} file(s) +{lines['added']}/-{lines['removed']} lines")
+        # Close any card whose file has stopped changing. This is per file, so
+        # finished work moves to Done while other files are still being edited.
+        for file_path, task in list(self.file_tasks.items()):
+            if now - task.get("last_change", now) >= IDLE_CLOSE_SEC:
+                self._complete_file_task(file_path, "No further changes")
+
+        if changed:
+            print(f"[keeper] Synced {len(changed):2d} file(s) +{lines['added']}/-{lines['removed']} lines")
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -477,12 +631,8 @@ class AgentKeeper:
                 self._beat_monitor()
                 # Always refresh the real MCP agent's heartbeat
                 self._beat_mcp_agent()
-                # Sync git changes
+                # Sync git changes (this also closes cards that went idle)
                 self._sync_changes()
-                # If editing activity has stopped for a while, close the per-file tasks
-                if self.file_tasks and self.last_change_ts and (time.time() - self.last_change_ts) >= IDLE_CLOSE_SEC:
-                    self._complete_all_tasks("No new file changes detected")
-                    self.last_change_ts = 0.0
             except Exception as e:
                 print(f"[keeper] Loop error: {e}")
             time.sleep(POLL_SEC)
@@ -525,6 +675,11 @@ class AgentKeeper:
 
     def stop(self):
         self.running = False
+        # Don't strand cards in In Progress when the keeper goes away.
+        try:
+            self._complete_all_tasks("Keeper stopped")
+        except Exception:
+            pass
         if self.api_proc:
             self.api_proc.terminate()
         if self.dash_proc:
@@ -550,6 +705,10 @@ def main():
     if not project.exists():
         print(f"[keeper] ERROR: path not found: {project}")
         sys.exit(1)
+
+    if not acquire_singleton_lock(project):
+        print(f"[keeper] Another keeper is already watching {project} — exiting.")
+        sys.exit(0)
 
     keeper = AgentKeeper(project,
                          start_api=not args.no_api,

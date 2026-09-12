@@ -1,0 +1,6 @@
+[mcp_servers.agent-track]
+command = "node"
+args = ["./packages/mcp-server/dist/index.js"]
+
+[mcp_servers.agent-track.env]
+DATABASE_PATH = "./packages/api-server/data/kanban.db"

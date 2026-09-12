@@ -27,6 +27,8 @@ import type {
 import { AgentStatus, TaskStatus, TaskImportance } from '@agent-track/shared';
 import { DEFAULT_COLUMNS } from './db/schema.js';
 import { notifyApiServer } from './utils/notifier.js';
+import { detectAgentIdentity, describeAgent } from './utils/agent-identity.js';
+import { launchDashboard } from './utils/launcher.js';
 
 interface AgentKanbanMCPServerOptions {
   cleanStaleDataOnStart?: boolean;
@@ -74,6 +76,64 @@ export class AgentKanbanMCPServer extends EventEmitter {
   }
 
   private registerTools() {
+    // ── Tracking lifecycle ────────────────────────────────────────────────────
+
+    this.server.registerTool(
+      'start_tracking',
+      {
+        description:
+          'Begin tracking this coding session on the dashboard. Binds to the board for the current project (creating it if needed), registers the running AI tool as an agent, opens a session, and — unless disabled — starts the dashboard and opens it in a browser. Call this when the user asks to start tracking; nothing is launched automatically.',
+        inputSchema: {
+          projectPath: z.string().optional().describe('Project directory. Defaults to the server working directory.'),
+          agentName: z.string().optional().describe('Override the detected agent name.'),
+          agentType: z.string().optional().describe('Override the detected agent type.'),
+          fresh: z.boolean().default(false).describe('Start a brand-new board instead of reusing the project board.'),
+          openDashboard: z.boolean().default(true).describe('Start the dashboard and open it in a browser.'),
+        },
+        outputSchema: {
+          boardId: z.string(),
+          agentId: z.string(),
+          sessionId: z.string(),
+          agentName: z.string(),
+          agentType: z.string(),
+          dashboardUrl: z.string(),
+        },
+        annotations: { readOnlyHint: false, idempotentHint: false },
+      },
+      (args) => {
+        const result = this.startTracking(args);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      },
+    );
+
+    this.server.registerTool(
+      'stop_tracking',
+      {
+        description:
+          'End the tracking session: finishes any tasks still open for this agent so nothing is left stranded in the In Progress column, then closes the session.',
+        inputSchema: {
+          sessionId: z.string().describe('Session ID returned by start_tracking'),
+          summary: z.string().optional().describe('What was accomplished this session'),
+          completeOpenTasks: z.boolean().default(true).describe('Mark this agent\'s unfinished tasks as done.'),
+        },
+        outputSchema: {
+          status: z.literal('ended'),
+          tasksCompleted: z.number(),
+        },
+        annotations: { readOnlyHint: false, idempotentHint: true },
+      },
+      (args) => {
+        const result = this.stopTracking(args);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      },
+    );
+
     // ── Board Management ──────────────────────────────────────────────────────
 
     this.server.registerTool(
@@ -155,8 +215,8 @@ export class AgentKanbanMCPServer extends EventEmitter {
       {
         description: 'Register an AI agent with its capabilities. Call once at the start of a session.',
         inputSchema: {
-          name: z.string().describe('Human-readable agent name'),
-          type: z.string().describe('Agent type (e.g., code-generator, code-assistant, reviewer)'),
+          name: z.string().optional().describe('Human-readable agent name. Omit to auto-detect the running tool (Claude Code, Codex, Gemini CLI, Cursor, …).'),
+          type: z.string().optional().describe('Agent type slug. Omit to auto-detect.'),
           capabilities: z.array(z.string()).optional().describe('List of capability tags'),
           maxConcurrentTasks: z.number().default(1).describe('Maximum number of tasks this agent can handle at once'),
         },
@@ -638,10 +698,14 @@ Call update_task_progress when switching between files or finishing a significan
   private registerAgent(args: any): { agentId: string } {
     const agentId = randomUUID();
 
+    // Never hard-code "Claude": when the caller doesn't name itself, use the
+    // tool detected from the environment (Codex, Gemini CLI, Cursor, …).
+    const identity = detectAgentIdentity();
+
     const agent: Agent = {
       id: agentId,
-      name: args.name,
-      type: args.type,
+      name: args.name || describeAgent(identity),
+      type: args.type || identity.type,
       status: AgentStatus.ACTIVE,
       capabilities: args.capabilities,
       maxConcurrentTasks: args.maxConcurrentTasks || 1,
@@ -1072,6 +1136,81 @@ Call update_task_progress when switching between files or finishing a significan
     } catch {
       return true;
     }
+  }
+
+  // ── Tracking lifecycle ──────────────────────────────────────────────────────
+
+  private startTracking(args: any): {
+    boardId: string;
+    agentId: string;
+    sessionId: string;
+    agentName: string;
+    agentType: string;
+    dashboardUrl: string;
+  } {
+    const projectPath = args.projectPath || process.cwd();
+
+    // Bind to the project's board. Reusing it is what keeps the MCP server, the
+    // activity hook and the keeper writing to the same place.
+    let boardId: string | undefined;
+    if (!args.fresh) {
+      boardId = this.findBoardByProjectPath(projectPath);
+    }
+    if (!boardId) {
+      boardId = this.createBoardForProject(projectPath);
+    }
+
+    const identity = detectAgentIdentity();
+    const agentName = args.agentName || describeAgent(identity);
+    const agentType = args.agentType || identity.type;
+
+    const { agentId } = this.registerAgent({
+      name: agentName,
+      type: agentType,
+      capabilities: ['code-generation', 'refactoring', 'debugging'],
+      maxConcurrentTasks: 3,
+    });
+
+    const { sessionId } = this.startSession({ agentId, boardId });
+
+    const dashboardUrl = `http://localhost:5173/board/${boardId}`;
+
+    if (args.openDashboard !== false) {
+      // Fire-and-forget: the launcher never rejects, and tracking must not
+      // block on a browser or a dev server coming up.
+      void launchDashboard(boardId);
+    }
+
+    return { boardId, agentId, sessionId, agentName, agentType, dashboardUrl };
+  }
+
+  private stopTracking(args: any): { status: 'ended'; tasksCompleted: number } {
+    const session = this.sessionRepo.get(args.sessionId);
+    let tasksCompleted = 0;
+
+    // Close out anything still open, otherwise these cards sit in In Progress
+    // forever once the tool that created them goes away.
+    if (session && args.completeOpenTasks !== false) {
+      const open = this.taskRepo
+        .getByBoard(session.boardId)
+        .filter(
+          (t) =>
+            t.agentId === session.agentId &&
+            t.status !== TaskStatus.DONE,
+        );
+
+      for (const task of open) {
+        this.completeTask({
+          taskId: task.id,
+          summary: args.summary || 'Completed when tracking stopped',
+        });
+        tasksCompleted++;
+      }
+    }
+
+    this.endSession({ sessionId: args.sessionId, summary: args.summary });
+
+    return { status: 'ended', tasksCompleted };
   }
 
   // ── Public Interface (used by index.ts) ─────────────────────────────────────
